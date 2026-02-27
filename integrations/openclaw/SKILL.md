@@ -41,7 +41,7 @@ Expected response:
 If the proxy is not running, start it:
 
 ```bash
-python3 ~/.openclaw/skills/orkestra/proxy.py &
+python3 {baseDir}/proxy.py &
 sleep 2
 # Then verify:
 curl -s http://127.0.0.1:8765/health
