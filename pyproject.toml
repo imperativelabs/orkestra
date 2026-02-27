@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "orkestra"
-version = "0.2.0"
+name = "orkestra-router"
+version = "0.0.1"
 description = "Smart LLM routing across providers - automatically picks the most cost-efficient model for your prompt"
 readme = "README.md"
 license = {text = "MIT"}

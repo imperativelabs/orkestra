@@ -5,13 +5,7 @@ Smart LLM routing across providers. Automatically selects the most cost-efficien
 ## Install
 
 ```bash
-pip install orkestra
-
-# With provider extras
-pip install orkestra[google]
-pip install orkestra[anthropic]
-pip install orkestra[openai]
-pip install orkestra[all]
+pip install orkestra-router
 ```
 
 ## Quick Start
