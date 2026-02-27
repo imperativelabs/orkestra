@@ -214,3 +214,9 @@ Every call returns a `Response` object with full transparency into what was used
 ## License
 
 MIT
+
+---
+
+## Integrations
+
+- [OpenClaw](integrations/openclaw/README.md) — use Orkestra as a cost-routing skill inside the [OpenClaw](https://github.com/openclaw/openclaw) personal AI assistant
