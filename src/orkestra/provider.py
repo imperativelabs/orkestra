@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Callable, Iterator
 
+from orkestra._events import (
+    ON_CHAT,
+    ON_CHUNK,
+    ON_REQUEST,
+    ON_RESPONSE,
+    ON_ROUTE,
+    ON_STREAM,
+    ON_STREAM_COMPLETE,
+    EventBus,
+    EventData,
+    EventName,
+    emit_event,
+)
+from orkestra._middleware import MiddlewareData, _global_middlewares, _run_chain
 from orkestra._types import Response
 from orkestra.providers import create_backend
 from orkestra.providers.base import ProviderBackend
 from orkestra.registry.models import (
-    PROVIDER_MODELS,
     DEFAULT_BASE_MODELS,
     DEFAULT_FALLBACK_MODELS,
+    PROVIDER_MODELS,
     calculate_cost,
 )
 
@@ -18,7 +32,8 @@ from orkestra.registry.models import (
 class Provider:
     """Routes prompts to the optimal model for a single LLM provider.
 
-    Usage:
+    Usage::
+
         import orkestra as o
 
         provider = o.Provider("google", "YOUR_API_KEY")
@@ -31,8 +46,9 @@ class Provider:
         response = provider.chat("Hello")  # uses gemini-3-flash-preview
 
         # Disable smart routing with a custom default model
-        provider = o.Provider("google", "YOUR_API_KEY", smart_routing=False, default_model="gemini-2.5-flash-lite")
-        response = provider.chat("Hello", model="gemini-3-pro-preview")  # per-call override
+        provider = o.Provider("google", "YOUR_API_KEY", smart_routing=False,
+                              default_model="gemini-2.5-flash-lite")
+        response = provider.chat("Hello", model="gemini-3-pro-preview")
 
     Supported providers: google, anthropic, openai.
     """
@@ -49,8 +65,8 @@ class Provider:
         Args:
             name: Provider name ("google", "anthropic", "openai").
             api_key: API key for the provider.
-            smart_routing: If True (default), uses KNN routing to pick the best model
-                per prompt. If False, uses a fixed default model.
+            smart_routing: If True (default), uses KNN routing to pick the best
+                model per prompt. If False, uses a fixed default model.
             default_model: Fixed model to use when smart_routing=False. If not
                 provided, falls back to the balanced-tier model for the provider.
                 Cannot be an empty string when smart_routing=False.
@@ -71,7 +87,49 @@ class Provider:
             self._default_model: str | None = None
         else:
             self._router = None
-            self._default_model = default_model if default_model is not None else DEFAULT_FALLBACK_MODELS.get(name)
+            self._default_model = (
+                default_model if default_model is not None
+                else DEFAULT_FALLBACK_MODELS.get(name)
+            )
+
+        # Per-provider middleware stack and event bus
+        self._middlewares: list[Callable] = []
+        self._event_bus = EventBus()
+
+    # ------------------------------------------------------------------
+    # Public decorator API
+    # ------------------------------------------------------------------
+
+    def middleware(self, fn: Callable) -> Callable:
+        """Register a provider-level middleware.
+
+        Usage::
+
+            @provider.middleware
+            def my_middleware(data: MiddlewareData, next):
+                print(f"prompt: {data.prompt}")
+                next()
+        """
+        self._middlewares.append(fn)
+        return fn
+
+    def event(self, event_name: EventName) -> Callable:
+        """Register a provider-level event handler.
+
+        Usage::
+
+            @provider.event("on_response")
+            def log_response(data: EventData):
+                print(f"model={data.model}")
+        """
+        def decorator(fn: Callable[[EventData], None]) -> Callable[[EventData], None]:
+            self._event_bus.on(event_name, fn)
+            return fn
+        return decorator
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     @property
     def name(self) -> str:
@@ -82,37 +140,25 @@ class Provider:
         if not self._smart_routing:
             if model is not None and model == "":
                 raise ValueError("model cannot be an empty string when smart_routing=False")
-            return model if model is not None else self._default_model
-        return self._router.route(prompt)
+            return model if model is not None else self._default_model #type:ignore
+        return self._router.route(prompt) #type:ignore
 
-    def chat(
+    def _emit(self, event_name: EventName, data: EventData) -> None:
+        """Fire event on both the global bus and this provider's bus."""
+        emit_event(event_name, data)
+        self._event_bus.emit(event_name, data)
+
+    def _build_response(
         self,
-        prompt: str,
-        *,
-        model: str | None = None,
-        max_tokens: int = 8192,
-        temperature: float = 1.0,
+        model: str,
+        result: dict,
     ) -> Response:
-        """Generate a response using the optimally-routed model.
-
-        Args:
-            prompt: The input prompt.
-            model: Override the model to use. Only applied when smart_routing=False;
-                cannot be an empty string in that case.
-            max_tokens: Maximum output tokens.
-            temperature: Sampling temperature.
-
-        Returns:
-            A Response with the generated text, cost, and savings info.
-        """
-        resolved_model = self._resolve_model(model, prompt)
-        result = self._backend.call(resolved_model, prompt, max_tokens, temperature)
-
+        """Construct a Response from a raw backend result dict."""
         input_tokens = result["input_tokens"]
         output_tokens = result["output_tokens"]
-        cost = calculate_cost(self.name, resolved_model, input_tokens, output_tokens)
+        cost = calculate_cost(self.name, model, input_tokens, output_tokens)
 
-        model_info = PROVIDER_MODELS[self.name][resolved_model]
+        model_info = PROVIDER_MODELS[self.name][model]
         input_cost = (input_tokens * model_info["input_price"]) / 1_000_000
         output_cost = (output_tokens * model_info["output_price"]) / 1_000_000
 
@@ -128,7 +174,7 @@ class Provider:
 
         return Response(
             text=result["text"],
-            model=resolved_model,
+            model=model,
             provider=self.name,
             cost=cost,
             input_tokens=input_tokens,
@@ -137,9 +183,72 @@ class Provider:
             output_cost=output_cost,
             savings=savings,
             savings_percent=savings_percent,
-            base_model=base_model or resolved_model,
+            base_model=base_model or model,
             base_cost=base_cost,
         )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def chat(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        max_tokens: int = 8192,
+        temperature: float = 1.0,
+    ) -> Response:
+        """Generate a response using the optimally-routed model.
+
+        Args:
+            prompt: The input prompt.
+            model: Override the model to use. Only applied when
+                smart_routing=False; cannot be an empty string in that case.
+            max_tokens: Maximum output tokens.
+            temperature: Sampling temperature.
+
+        Returns:
+            A Response with the generated text, cost, and savings info.
+        """
+        mw_data = MiddlewareData(
+            prompt=prompt,
+            provider=self.name,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            event="chat",
+        )
+
+        # Fire pre-execution events
+        pre_event = EventData(event=ON_REQUEST, provider=self.name, prompt=prompt)
+        self._emit(ON_REQUEST, pre_event)
+        self._emit(ON_CHAT, EventData(event=ON_CHAT, provider=self.name, prompt=prompt))
+
+        def final_handler(data: MiddlewareData) -> None:
+            resolved = self._resolve_model(data.model, data.prompt)
+            data.model = resolved
+
+            route_event = EventData(
+                event=ON_ROUTE, provider=self.name, prompt=data.prompt, model=resolved
+            )
+            self._emit(ON_ROUTE, route_event)
+
+            result = self._backend.call(resolved, data.prompt, data.max_tokens, data.temperature)
+            data.response = self._build_response(resolved, result)
+
+        _run_chain(_global_middlewares + self._middlewares, mw_data, final_handler)
+
+        response_event = EventData(
+            event=ON_RESPONSE,
+            provider=self.name,
+            prompt=mw_data.prompt,
+            model=mw_data.model,
+            response=mw_data.response,
+        )
+        self._emit(ON_RESPONSE, response_event)
+
+        return mw_data.response
 
     def stream_text(
         self,
@@ -151,15 +260,66 @@ class Provider:
     ) -> Iterator[str]:
         """Stream text from the optimally-routed model.
 
+        Middleware runs before the stream begins (can mutate prompt/model).
+        Events fire per-chunk and on completion.
+
         Args:
             prompt: The input prompt.
-            model: Override the model to use. Only applied when smart_routing=False;
-                cannot be an empty string in that case.
+            model: Override the model to use. Only applied when
+                smart_routing=False; cannot be an empty string in that case.
             max_tokens: Maximum output tokens.
             temperature: Sampling temperature.
 
         Yields:
             Text chunks as they arrive.
         """
-        resolved_model = self._resolve_model(model, prompt)
-        yield from self._backend.stream(resolved_model, prompt, max_tokens, temperature)
+        mw_data = MiddlewareData(
+            prompt=prompt,
+            provider=self.name,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            event="stream",
+        )
+
+        # Fire pre-execution events
+        self._emit(ON_REQUEST, EventData(event=ON_REQUEST, provider=self.name, prompt=prompt))
+        self._emit(ON_STREAM, EventData(event=ON_STREAM, provider=self.name, prompt=prompt))
+
+        def pre_handler(data: MiddlewareData) -> None:
+            resolved = self._resolve_model(data.model, data.prompt)
+            data.model = resolved
+            self._emit(
+                ON_ROUTE,
+                EventData(event=ON_ROUTE, provider=self.name, prompt=data.prompt, model=resolved),
+            )
+
+        _run_chain(_global_middlewares + self._middlewares, mw_data, pre_handler)
+
+        resolved_model = mw_data.model
+        resolved_prompt = mw_data.prompt
+
+        def _wrapped_stream() -> Iterator[str]:
+            for chunk in self._backend.stream(resolved_model, resolved_prompt, max_tokens, temperature): #type:ignore
+                self._emit(
+                    ON_CHUNK,
+                    EventData(
+                        event=ON_CHUNK,
+                        provider=self.name,
+                        prompt=resolved_prompt,
+                        model=resolved_model,
+                        metadata={"chunk": chunk},
+                    ),
+                )
+                yield chunk
+            self._emit(
+                ON_STREAM_COMPLETE,
+                EventData(
+                    event=ON_STREAM_COMPLETE,
+                    provider=self.name,
+                    prompt=resolved_prompt,
+                    model=resolved_model,
+                ),
+            )
+
+        yield from _wrapped_stream()

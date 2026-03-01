@@ -85,6 +85,150 @@ for chunk in provider.stream_text("Write a poem about the sea"):
 
 ---
 
+## Disable Smart Routing
+
+When you need a fixed model instead of KNN routing:
+
+```python
+import orkestra as o
+
+# Uses claude-sonnet-4-5 by default when smart_routing=False
+provider = o.Provider("anthropic", "YOUR_KEY", smart_routing=False)
+
+# Or specify your own default model
+provider = o.Provider("anthropic", "YOUR_KEY", smart_routing=False, default_model="claude-haiku-4")
+
+# Override per call
+response = provider.chat("Hello", model="claude-opus-4")
+```
+
+---
+
+## Events
+
+Orkestra fires lifecycle events at every stage of a request. Register handlers globally or per-provider to log, monitor, or instrument your calls.
+
+**Global events** fire for every provider:
+
+```python
+from orkestra import register_event, EventData
+
+@register_event("on_response")
+def log_cost(data: EventData):
+    print(f"[{data.provider}] {data.model} — ${data.response.cost:.6f}")
+
+@register_event("on_route")
+def track_routing(data: EventData):
+    print(f"Routed to: {data.model}")
+
+@register_event("on_chunk")
+def on_chunk(data: EventData):
+    print(data.metadata["chunk"], end="", flush=True)
+
+@register_event("on_stream_complete")
+def on_done(data: EventData):
+    print()  # newline after stream
+```
+
+**Provider-level events** fire only for that provider instance:
+
+```python
+provider = o.Provider("anthropic", "YOUR_KEY")
+
+@provider.event("on_response")
+def log_anthropic(data: EventData):
+    print(f"Anthropic cost: ${data.response.cost:.6f}")
+```
+
+**All event names:**
+
+| Event | When it fires | Notable `data` fields |
+|-------|--------------|----------------------|
+| `"on_request"` | Before any call (chat or stream) | `provider`, `prompt` |
+| `"on_chat"` | Before `chat()` executes | `provider`, `prompt` |
+| `"on_stream"` | Before `stream_text()` executes | `provider`, `prompt` |
+| `"on_route"` | After the model is selected | `model` |
+| `"on_response"` | After `chat()` returns | `model`, `response` |
+| `"on_chunk"` | Per chunk in `stream_text()` | `metadata["chunk"]` |
+| `"on_stream_complete"` | Stream generator exhausted | `model` |
+
+---
+
+## Middleware
+
+Middleware intercepts every request/response in a pipeline — like Express.js. Call `next()` to continue, skip it to short-circuit. Mutate `data` before `next()` to transform the request; read `data.response` after to inspect or alter the result.
+
+**Global middleware** runs for every provider:
+
+```python
+from orkestra import register_middleware, MiddlewareData
+
+@register_middleware
+def add_system_context(data: MiddlewareData, next):
+    data.prompt = f"You are a helpful assistant.\n\n{data.prompt}"
+    next()
+
+@register_middleware
+def log_latency(data: MiddlewareData, next):
+    import time
+    start = time.time()
+    next()
+    elapsed = time.time() - start
+    print(f"[{data.provider}] {elapsed:.2f}s — {data.response.output_tokens} tokens")
+```
+
+**Provider-level middleware** runs only for that instance, after global middleware:
+
+```python
+provider = o.Provider("anthropic", "YOUR_KEY")
+
+@provider.middleware
+def anthropic_audit(data: MiddlewareData, next):
+    print(f"Sending to Anthropic: {data.prompt[:80]}")
+    next()
+    print(f"Response: {data.response.text[:80]}")
+```
+
+**Register without decorators** (useful for third-party middleware packages):
+
+```python
+from orkestra import register_middleware
+import my_logging_middleware
+
+register_middleware(my_logging_middleware.track)  # global
+provider.middleware(my_logging_middleware.track)  # provider-level
+```
+
+**Short-circuit a request** by not calling `next()`:
+
+```python
+from orkestra import register_middleware
+
+blocked_terms = ["confidential", "internal only"]
+
+@register_middleware
+def content_filter(data: MiddlewareData, next):
+    if any(term in data.prompt.lower() for term in blocked_terms):
+        data.response = None  # block the call
+        return
+    next()
+```
+
+**`MiddlewareData` fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prompt` | `str` | The prompt — mutate before `next()` to transform it |
+| `provider` | `str` | Provider name |
+| `model` | `str \| None` | Resolved model (set after routing) |
+| `max_tokens` | `int` | Max output tokens |
+| `temperature` | `float` | Sampling temperature |
+| `event` | `str` | `"chat"` or `"stream"` |
+| `response` | `Response \| None` | Populated after `next()` returns |
+| `metadata` | `dict` | User-extensible bag for passing data through the chain |
+
+---
+
 ## How It Works
 
 Orkestra classifies every prompt at call time using a lightweight ML router — no config required.
@@ -151,26 +295,60 @@ Orkestra knows when to save and when to spend.
 
 ## API Reference
 
-### `o.Provider(name, api_key)`
+### `o.Provider(name, api_key, *, smart_routing=True, default_model=None)`
 
 Create a single-provider router.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | `str` | `"google"`, `"anthropic"`, or `"openai"` |
-| `api_key` | `str` | Your API key for the chosen provider |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` | — | `"google"`, `"anthropic"`, or `"openai"` |
+| `api_key` | `str` | — | Your API key for the chosen provider |
+| `smart_routing` | `bool` | `True` | When `False`, skips KNN routing and uses a fixed model |
+| `default_model` | `str \| None` | `None` | Fixed model to use when `smart_routing=False`; defaults to the balanced-tier model |
 
 ---
 
-### `provider.chat(prompt, *, max_tokens=8192, temperature=1.0)`
+### `provider.chat(prompt, *, model=None, max_tokens=8192, temperature=1.0)`
 
 Route a prompt and return a full response. Returns an `orkestra.Response`.
 
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `model` | `str \| None` | Per-call model override (only used when `smart_routing=False`) |
+
 ---
 
-### `provider.stream_text(prompt, *, max_tokens=8192, temperature=1.0)`
+### `provider.stream_text(prompt, *, model=None, max_tokens=8192, temperature=1.0)`
 
 Stream response tokens as they arrive. Yields `str` chunks.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `model` | `str \| None` | Per-call model override (only used when `smart_routing=False`) |
+
+---
+
+### `provider.middleware(fn)`
+
+Register a middleware on this provider. Works as a decorator or plain call.
+
+---
+
+### `provider.event(event_name)`
+
+Register an event handler on this provider. Use as a decorator: `@provider.event("on_response")`.
+
+---
+
+### `register_middleware(fn)`
+
+Register a global middleware that runs for every provider. Works as a decorator or plain call.
+
+---
+
+### `register_event(event_name)`
+
+Register a global event handler. Use as a decorator: `@register_event("on_response")`.
 
 ---
 
