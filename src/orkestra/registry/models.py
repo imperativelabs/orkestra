@@ -70,6 +70,13 @@ DEFAULT_BASE_MODELS: dict[str, str] = {
     "openai": "o3",
 }
 
+# Fallback model per provider when smart_routing=False and no default_model is given
+DEFAULT_FALLBACK_MODELS: dict[str, str] = {
+    "google": "gemini-3-flash-preview",
+    "anthropic": "claude-sonnet-4-5",
+    "openai": "gpt-4o",
+}
+
 # Tier ordering for strategy comparisons
 TIER_RANK = {"budget": 0, "balanced": 1, "premium": 2}
 

@@ -10,9 +10,9 @@ from orkestra.providers.base import ProviderBackend
 from orkestra.registry.models import (
     PROVIDER_MODELS,
     DEFAULT_BASE_MODELS,
+    DEFAULT_FALLBACK_MODELS,
     calculate_cost,
 )
-from orkestra.router.knn import KNNRouter
 
 
 class Provider:
@@ -26,28 +26,70 @@ class Provider:
         print(response.text)
         print(f"Model: {response.model}, Cost: ${response.cost:.6f}")
 
+        # Disable smart routing and use a fixed model
+        provider = o.Provider("google", "YOUR_API_KEY", smart_routing=False)
+        response = provider.chat("Hello")  # uses gemini-3-flash-preview
+
+        # Disable smart routing with a custom default model
+        provider = o.Provider("google", "YOUR_API_KEY", smart_routing=False, default_model="gemini-2.5-flash-lite")
+        response = provider.chat("Hello", model="gemini-3-pro-preview")  # per-call override
+
     Supported providers: google, anthropic, openai.
     """
 
-    def __init__(self, name: str, api_key: str):
-        """Initialize a provider with routing.
+    def __init__(
+        self,
+        name: str,
+        api_key: str,
+        smart_routing: bool = True,
+        default_model: str | None = None,
+    ):
+        """Initialize a provider with optional smart routing.
 
         Args:
             name: Provider name ("google", "anthropic", "openai").
             api_key: API key for the provider.
+            smart_routing: If True (default), uses KNN routing to pick the best model
+                per prompt. If False, uses a fixed default model.
+            default_model: Fixed model to use when smart_routing=False. If not
+                provided, falls back to the balanced-tier model for the provider.
+                Cannot be an empty string when smart_routing=False.
+
+        Raises:
+            ValueError: If smart_routing=False and default_model is an empty string.
         """
+        if not smart_routing and default_model is not None and default_model == "":
+            raise ValueError("default_model cannot be an empty string when smart_routing=False")
+
         self._backend: ProviderBackend = create_backend(name, api_key)
-        self._router = KNNRouter(provider=name)
+        self._smart_routing = smart_routing
         self._base_model = DEFAULT_BASE_MODELS.get(name)
+
+        if smart_routing:
+            from orkestra.router.knn import KNNRouter
+            self._router = KNNRouter(provider=name)
+            self._default_model: str | None = None
+        else:
+            self._router = None
+            self._default_model = default_model if default_model is not None else DEFAULT_FALLBACK_MODELS.get(name)
 
     @property
     def name(self) -> str:
         return self._backend.name
 
+    def _resolve_model(self, model: str | None, prompt: str) -> str:
+        """Resolve which model to use for a request."""
+        if not self._smart_routing:
+            if model is not None and model == "":
+                raise ValueError("model cannot be an empty string when smart_routing=False")
+            return model if model is not None else self._default_model
+        return self._router.route(prompt)
+
     def chat(
         self,
         prompt: str,
         *,
+        model: str | None = None,
         max_tokens: int = 8192,
         temperature: float = 1.0,
     ) -> Response:
@@ -55,20 +97,22 @@ class Provider:
 
         Args:
             prompt: The input prompt.
+            model: Override the model to use. Only applied when smart_routing=False;
+                cannot be an empty string in that case.
             max_tokens: Maximum output tokens.
             temperature: Sampling temperature.
 
         Returns:
             A Response with the generated text, cost, and savings info.
         """
-        model = self._router.route(prompt)
-        result = self._backend.call(model, prompt, max_tokens, temperature)
+        resolved_model = self._resolve_model(model, prompt)
+        result = self._backend.call(resolved_model, prompt, max_tokens, temperature)
 
         input_tokens = result["input_tokens"]
         output_tokens = result["output_tokens"]
-        cost = calculate_cost(self.name, model, input_tokens, output_tokens)
+        cost = calculate_cost(self.name, resolved_model, input_tokens, output_tokens)
 
-        model_info = PROVIDER_MODELS[self.name][model]
+        model_info = PROVIDER_MODELS[self.name][resolved_model]
         input_cost = (input_tokens * model_info["input_price"]) / 1_000_000
         output_cost = (output_tokens * model_info["output_price"]) / 1_000_000
 
@@ -84,7 +128,7 @@ class Provider:
 
         return Response(
             text=result["text"],
-            model=model,
+            model=resolved_model,
             provider=self.name,
             cost=cost,
             input_tokens=input_tokens,
@@ -93,7 +137,7 @@ class Provider:
             output_cost=output_cost,
             savings=savings,
             savings_percent=savings_percent,
-            base_model=base_model or model,
+            base_model=base_model or resolved_model,
             base_cost=base_cost,
         )
 
@@ -101,6 +145,7 @@ class Provider:
         self,
         prompt: str,
         *,
+        model: str | None = None,
         max_tokens: int = 8192,
         temperature: float = 1.0,
     ) -> Iterator[str]:
@@ -108,11 +153,13 @@ class Provider:
 
         Args:
             prompt: The input prompt.
+            model: Override the model to use. Only applied when smart_routing=False;
+                cannot be an empty string in that case.
             max_tokens: Maximum output tokens.
             temperature: Sampling temperature.
 
         Yields:
             Text chunks as they arrive.
         """
-        model = self._router.route(prompt)
-        yield from self._backend.stream(model, prompt, max_tokens, temperature)
+        resolved_model = self._resolve_model(model, prompt)
+        yield from self._backend.stream(resolved_model, prompt, max_tokens, temperature)
